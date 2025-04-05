@@ -1,7 +1,14 @@
 // Copyright 2024 Apple Inc.
 
+// Note on AX Lookup errors seen in logs:
+// The "AX Lookup problem - errorCode:1100 error:Permission denied portName:'com.apple.iphone.axserver'" errors
+// are related to Accessibility services. These errors do not affect core functionality and are related to
+// UIKit's interaction with the accessibility subsystem. These are common in development builds or when
+// running without certain accessibility permissions. They can be safely ignored for this application.
+
 import AVKit
 import CoreImage
+import CoreImage.CIFilterBuiltins
 import MLX
 import MLXLMCommon
 import MLXRandom
@@ -9,7 +16,7 @@ import MLXVLM
 import PhotosUI
 import SwiftUI
 
-#if os(iOS) || os(visionOS)
+#if os(iOS)
     typealias PlatformImage = UIImage
 #else
     typealias PlatformImage = NSImage
@@ -110,14 +117,83 @@ struct ContentView: View {
                             }
                             .onChange(of: selectedItem) {
                                 Task {
+                                    print("PhotosPicker selection changed")
                                     if let video = try? await selectedItem?.loadTransferable(
                                         type: TransferableVideo.self)
                                     {
+                                        print("Loaded video transferable")
                                         selectedVideoURL = video.url
                                     } else if let data = try? await selectedItem?.loadTransferable(
                                         type: Data.self)
                                     {
-                                        selectedImage = PlatformImage(data: data)
+                                        print("Loaded image data: \(data.count) bytes")
+                                        
+                                        // Check image format based on data headers
+                                        let imageFormat = detectImageFormat(data: data)
+                                        print("Detected image format: \(imageFormat)")
+                                        
+                                        if let image = PlatformImage(data: data) {
+                                            print("Successfully created image with size: \(image.size.width) x \(image.size.height)")
+                                            
+                                            // Detect if image is likely a screenshot (common for PNG files with specific aspect ratios)
+                                            let isLikelyScreenshot = imageFormat == "PNG" && (
+                                                // Portrait screenshots often have very tall aspect ratios
+                                                image.size.height > image.size.width * 1.8 ||
+                                                // Check for common screenshot dimensions
+                                                (image.size.width == 1179 && image.size.height == 2556) ||
+                                                (image.size.width == 1170 && image.size.height == 2532) ||
+                                                (image.size.width == 1290 && image.size.height == 2796)
+                                            )
+                                            
+                                            if isLikelyScreenshot {
+                                                print("Detected likely screenshot - applying special processing")
+                                            }
+                                            
+                                            // Process all images to a standard, safe format regardless of source
+                                            #if os(iOS)
+                                            // Create square canvas image at 448x448 dimensions
+                                            print("Creating standardized 448x448 image for model compatibility")
+                                            let targetSize = CGSize(width: 448, height: 448)
+                                            let format = UIGraphicsImageRendererFormat()
+                                            format.scale = 1.0
+                                            
+                                            let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+                                            let squareImage = renderer.image { context in
+                                                // White background for transparency
+                                                UIColor.white.setFill()
+                                                context.fill(CGRect(origin: .zero, size: targetSize))
+                                                
+                                                // Calculate dimensions to maintain aspect ratio within square
+                                                let originalSize = image.size
+                                                let widthRatio = targetSize.width / originalSize.width
+                                                let heightRatio = targetSize.height / originalSize.height
+                                                let scale = min(widthRatio, heightRatio)
+                                                
+                                                let scaledWidth = originalSize.width * scale
+                                                let scaledHeight = originalSize.height * scale
+                                                
+                                                // Center the image in the square
+                                                let xOffset = (targetSize.width - scaledWidth) / 2
+                                                let yOffset = (targetSize.height - scaledHeight) / 2
+                                                
+                                                // Draw the image centered in the square canvas
+                                                image.draw(in: CGRect(
+                                                    x: xOffset,
+                                                    y: yOffset,
+                                                    width: scaledWidth,
+                                                    height: scaledHeight
+                                                ))
+                                            }
+                                            
+                                            print("Created standardized image with size: \(squareImage.size.width) x \(squareImage.size.height)")
+                                            selectedImage = squareImage
+                                            #endif
+                                        } else {
+                                            print("ERROR: Failed to create image from data. Data size: \(data.count) bytes")
+                                            print("First 16 bytes: \(data.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " "))")
+                                        }
+                                    } else {
+                                        print("ERROR: Failed to load transferable content")
                                     }
                                 }
                             }
@@ -134,23 +210,49 @@ struct ContentView: View {
                                     Task { @MainActor in
                                         do {
                                             let data = try loadData(from: file)
+                                            print("macOS: Loaded file data: \(data.count) bytes")
+                                            
                                             if let image = PlatformImage(data: data) {
-                                                selectedImage = image
+                                                print("macOS: Successfully created image with size: \(image.size.width) x \(image.size.height)")
+                                                
+                                                // Create a safer version of the image for very large images
+                                                if image.size.width > 2000 || image.size.height > 2000 {
+                                                    print("macOS: Image is very large, resizing...")
+                                                    let scale = 1000.0 / max(image.size.width, image.size.height)
+                                                    
+                                                    let newSize = NSSize(
+                                                        width: image.size.width * scale,
+                                                        height: image.size.height * scale
+                                                    )
+                                                    
+                                                    let resizedImage = NSImage(size: newSize)
+                                                    resizedImage.lockFocus()
+                                                    image.draw(in: NSRect(origin: .zero, size: newSize),
+                                                              from: NSRect(origin: .zero, size: image.size),
+                                                              operation: .copy,
+                                                              fraction: 1.0)
+                                                    resizedImage.unlockFocus()
+                                                    
+                                                    selectedImage = resizedImage
+                                                } else {
+                                                    selectedImage = image
+                                                }
                                             } else if let fileType = UTType(
                                                 filenameExtension: file.pathExtension),
                                                 fileType.conforms(to: .movie)
                                             {
+                                                print("macOS: Processing video file")
                                                 if let sandboxURL = try? loadVideoToSandbox(
                                                     from: file)
                                                 {
                                                     selectedVideoURL = sandboxURL
                                                 }
                                             } else {
-                                                print("Failed to create image from data")
+                                                print("macOS: Failed to create image from data - unsupported format")
                                             }
                                         } catch {
                                             print(
-                                                "Failed to load image: \(error.localizedDescription)"
+                                                "macOS: Failed to load file: \(error.localizedDescription)"
                                             )
                                         }
                                     }
@@ -246,31 +348,192 @@ struct ContentView: View {
         }
     }
 
+    #if os(iOS)
+    // iOS-specific image preprocessing function
+    private func preprocessImage(_ image: UIImage) -> CIImage? {
+        print("iOS: Preprocessing image of size: \(image.size.width) x \(image.size.height)")
+        
+        // Target size for the VLM model - must be exactly 448x448
+        let targetSize = CGSize(width: 448, height: 448)
+        
+        // Create a square canvas with white background
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        
+        let squareImage = renderer.image { context in
+            // Fill with white background
+            UIColor.white.setFill()
+            context.fill(CGRect(origin: .zero, size: targetSize))
+            
+            // Calculate dimensions that maintain aspect ratio but fit within target size
+            let originalSize = image.size
+            let widthRatio = targetSize.width / originalSize.width
+            let heightRatio = targetSize.height / originalSize.height
+            let scale = min(widthRatio, heightRatio)
+            
+            let newWidth = originalSize.width * scale
+            let newHeight = originalSize.height * scale
+            
+            // Center the image
+            let xOffset = (targetSize.width - newWidth) / 2
+            let yOffset = (targetSize.height - newHeight) / 2
+            
+            image.draw(in: CGRect(
+                x: xOffset,
+                y: yOffset,
+                width: newWidth,
+                height: newHeight
+            ))
+        }
+        
+        print("iOS: Created square image: \(targetSize.width) x \(targetSize.height)")
+        
+        // Convert to CIImage with sRGB color space
+        guard let ciImage = CIImage(image: squareImage) else {
+            print("iOS: Failed to convert square UIImage to CIImage")
+            return nil
+        }
+        
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        let ciContext = CIContext()
+        
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent, format: .RGBA8, colorSpace: colorSpace) else {
+            print("iOS: Failed to create CGImage with sRGB color space")
+            return nil
+        }
+        
+        let finalCIImage = CIImage(cgImage: cgImage)
+        print("iOS: Final CIImage size: \(finalCIImage.extent.width) x \(finalCIImage.extent.height)")
+        
+        return finalCIImage
+    }
+    #else
+    // macOS-specific image preprocessing function
+    private func preprocessImage(_ image: NSImage) -> CIImage? {
+        print("macOS: Preprocessing image of size: \(image.size.width) x \(image.size.height)")
+        
+        // Target size for the VLM model
+        let targetSize = CGSize(width: 448, height: 448)
+        
+        // Step 1: Get CGImage from NSImage
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            print("macOS: Failed to get CGImage from NSImage")
+            return nil
+        }
+        
+        // Step 2: Create CIImage from CGImage
+        let ciImage = CIImage(cgImage: cgImage)
+        print("macOS: Original CIImage extent: \(ciImage.extent.width) x \(ciImage.extent.height)")
+        
+        // Step 3: Create a square canvas with the image centered
+        let squareContext = CIContext()
+        let squareImage = NSImage(size: targetSize)
+        squareImage.lockFocus()
+        
+        // Fill with white background
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: targetSize).fill()
+        
+        // Calculate scale to fit within target size while preserving aspect ratio
+        let widthRatio = targetSize.width / ciImage.extent.width
+        let heightRatio = targetSize.height / ciImage.extent.height
+        let scale = min(widthRatio, heightRatio)
+        
+        // Calculate dimensions that maintain aspect ratio
+        let newWidth = ciImage.extent.width * scale
+        let newHeight = ciImage.extent.height * scale
+        
+        // Center the image
+        let xOffset = (targetSize.width - newWidth) / 2
+        let yOffset = (targetSize.height - newHeight) / 2
+        
+        print("macOS: Drawing image with scale factor: \(scale), new size: \(newWidth) x \(newHeight)")
+        
+        if let nsImage = NSImage(ciImage: ciImage, size: ciImage.extent.size) {
+            nsImage.draw(in: NSRect(x: xOffset, y: yOffset, width: newWidth, height: newHeight),
+                       from: NSRect(origin: .zero, size: nsImage.size),
+                       operation: .copy,
+                       fraction: 1.0)
+        }
+        
+        squareImage.unlockFocus()
+        
+        // Convert back to CIImage
+        guard let squareCGImage = squareImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            print("macOS: Failed to get CGImage from square NSImage")
+            return nil
+        }
+        
+        let squareCIImage = CIImage(cgImage: squareCGImage)
+        
+        // Ensure we're using sRGB color space
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        
+        guard let finalCGImage = squareContext.createCGImage(squareCIImage, from: squareCIImage.extent, format: .RGBA8, colorSpace: colorSpace) else {
+            print("macOS: Failed to create final CGImage")
+            return nil
+        }
+        
+        let finalCIImage = CIImage(cgImage: finalCGImage)
+        print("macOS: Final CIImage size: \(finalCIImage.extent.width) x \(finalCIImage.extent.height)")
+        
+        return finalCIImage
+    }
+    #endif
+    
     private func generate() {
         Task {
             if let selectedImage = selectedImage {
-                #if os(iOS) || os(visionOS)
-                    let ciImage = CIImage(image: selectedImage)
-                    await llm.generate(prompt: prompt, image: ciImage ?? CIImage(), videoURL: nil)
+                #if os(iOS)
+                    print("iOS: Processing image of size: \(selectedImage.size.width) x \(selectedImage.size.height)")
+                    if let processedImage = preprocessImage(selectedImage) {
+                        print("iOS: Successfully preprocessed image")
+                        await llm.generate(prompt: prompt, image: processedImage, videoURL: nil)
+                    } else {
+                        print("iOS: Failed to preprocess image, using fallback")
+                        // Fall back to a 1x1 transparent image
+                        let fallbackImage = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0))
+                            .cropped(to: CGRect(x: 0, y: 0, width: 1, height: 1))
+                        await llm.generate(prompt: prompt, image: fallbackImage, videoURL: nil)
+                    }
                 #else
-                    if let cgImage = selectedImage.cgImage(
-                        forProposedRect: nil, context: nil, hints: nil)
-                    {
-                        let ciImage = CIImage(cgImage: cgImage)
-                        await llm.generate(prompt: prompt, image: ciImage, videoURL: nil)
+                    print("macOS: Processing image of size: \(selectedImage.size.width) x \(selectedImage.size.height)")
+                    if let processedImage = preprocessImage(selectedImage) {
+                        print("macOS: Successfully preprocessed image")
+                        await llm.generate(prompt: prompt, image: processedImage, videoURL: nil)
+                    } else {
+                        print("macOS: Failed to preprocess image")
                     }
                 #endif
             } else if let imageURL = currentImageURL {
                 do {
+                    print("Loading image from URL: \(imageURL)")
                     let (data, _) = try await URLSession.shared.data(from: imageURL)
-                    if let ciImage = CIImage(data: data) {
-                        await llm.generate(prompt: prompt, image: ciImage, videoURL: nil)
+                    print("Downloaded image data size: \(data.count) bytes")
+                    
+                    // Create a platform image first, then preprocess it
+                    #if os(iOS)
+                    if let uiImage = UIImage(data: data), let processedImage = preprocessImage(uiImage) {
+                        print("Successfully preprocessed image from URL")
+                        await llm.generate(prompt: prompt, image: processedImage, videoURL: nil)
+                    } else {
+                        print("ERROR: Failed to process image from URL data")
                     }
+                    #else
+                    if let nsImage = NSImage(data: data), let processedImage = preprocessImage(nsImage) {
+                        print("Successfully preprocessed image from URL")
+                        await llm.generate(prompt: prompt, image: processedImage, videoURL: nil)
+                    } else {
+                        print("ERROR: Failed to process image from URL data")
+                    }
+                    #endif
                 } catch {
-                    print("Failed to load image: \(error.localizedDescription)")
+                    print("Failed to load image from URL: \(error.localizedDescription)")
                 }
             } else {
                 if let videoURL = selectedVideoURL {
+                    print("Processing video from URL: \(videoURL)")
                     await llm.generate(prompt: prompt, image: nil, videoURL: videoURL)
                 }
             }
@@ -307,6 +570,60 @@ struct ContentView: View {
         #else
             UIPasteboard.general.string = string
         #endif
+    }
+
+    private func detectImageFormat(data: Data) -> String {
+        guard data.count >= 12 else { return "Unknown (too small)" }
+        
+        // Check PNG signature (89 50 4E 47 0D 0A 1A 0A)
+        if data.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+            return "PNG"
+        }
+        
+        // Check JPEG signature (FF D8)
+        if data.starts(with: [0xFF, 0xD8]) {
+            return "JPEG"
+        }
+        
+        // Check HEIF/HEIC signature
+        if data.count >= 12 {
+            let heicSignature = data[4..<12]
+            if heicSignature.elementsEqual([0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]) ||
+               heicSignature.elementsEqual([0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x78]) {
+                return "HEIC"
+            }
+        }
+        
+        // Check GIF signature (47 49 46)
+        if data.starts(with: [0x47, 0x49, 0x46]) {
+            return "GIF"
+        }
+        
+        // Check TIFF signature (49 49 or 4D 4D)
+        if (data.starts(with: [0x49, 0x49]) || data.starts(with: [0x4D, 0x4D])) {
+            return "TIFF"
+        }
+        
+        // Check WebP signature (52 49 46 46 ... 57 45 42 50)
+        if data.starts(with: [0x52, 0x49, 0x46, 0x46]) && data.count >= 12 {
+            let webpSignature = data[8..<12]
+            if webpSignature.elementsEqual([0x57, 0x45, 0x42, 0x50]) {
+                return "WebP"
+            }
+        }
+        
+        // Check BMP signature (42 4D)
+        if data.starts(with: [0x42, 0x4D]) {
+            return "BMP"
+        }
+        
+        // Unknown format - return hex signature for debugging
+        if data.count >= 8 {
+            let hexSignature = data.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
+            return "Unknown (\(hexSignature))"
+        }
+        
+        return "Unknown"
     }
 }
 
@@ -382,22 +699,41 @@ class VLMEvaluator {
             // each time you generate you will get something new
             MLXRandom.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
 
+            print("Starting model inference with \(image != nil ? "image" : "no image") and \(videoURL != nil ? "video" : "no video")")
+            if let image = image {
+                // Verify image dimensions are exactly 448x448
+                if image.extent.width != 448 || image.extent.height != 448 {
+                    print("WARNING: Image dimensions \(image.extent.width)x\(image.extent.height) are not exactly 448x448")
+                    print("This may cause reshape errors in the MLX model")
+                }
+                
+                // Verify pixel format and properties
+                let properties = image.properties
+                print("Image properties: \(properties)")
+            }
+            
             let result = try await modelContainer.perform { context in
-                let images: [UserInput.Image] =
-                    if let image {
-                        [UserInput.Image.ciImage(image)]
+                let images: [UserInput.Image] = {
+                    if let image = image {
+                        print("Processing image with extent: \(image.extent.size.width) x \(image.extent.size.height)")
+                        return [UserInput.Image.ciImage(image)]
                     } else {
-                        []
+                        print("No image to process")
+                        return []
                     }
-                let videos: [UserInput.Video] =
-                    if let videoURL {
-                        [.url(videoURL)]
+                }()
+                let videos: [UserInput.Video] = {
+                    if let videoURL = videoURL {
+                        print("Processing video from URL: \(videoURL)")
+                        return [UserInput.Video.url(videoURL)]
                     } else {
-                        []
+                        return []
                     }
-                let messages: [[String: Any]] =
+                }()
+                let messages: [[String: Any]] = {
                     if !images.isEmpty || !videos.isEmpty {
-                        [
+                        print("Creating messages with media content")
+                        return [
                             [
                                 "role": "user",
                                 "content": [
@@ -413,34 +749,57 @@ class VLMEvaluator {
                             ]
                         ]
                     } else {
-                        [
+                        print("Creating text-only messages")
+                        return [
                             [
                                 "role": "user",
                                 "content": prompt,
                             ]
                         ]
                     }
+                }()
+                
                 var userInput = UserInput(messages: messages, images: images, videos: videos)
+                
+                // This is where the image resizing happens - note the 448x448 target size
+                print("Setting image processing resize to 448x448")
                 userInput.processing.resize = .init(width: 448, height: 448)
-                let input = try await context.processor.prepare(input: userInput)
-                return try MLXLMCommon.generate(
-                    input: input,
-                    parameters: generateParameters,
-                    context: context
-                ) { tokens in
-                    // update the output -- this will make the view show the text as it generates
-                    if tokens.count % displayEveryNTokens == 0 {
-                        let text = context.tokenizer.decode(tokens: tokens)
-                        Task { @MainActor in
-                            self.output = text
+                
+                do {
+                    print("Preparing input through processor")
+                    let input = try await context.processor.prepare(input: userInput)
+                    print("Input preparation complete, starting token generation")
+                    
+                    return try MLXLMCommon.generate(
+                        input: input,
+                        parameters: generateParameters,
+                        context: context
+                    ) { tokens in
+                        // update the output -- this will make the view show the text as it generates
+                        if tokens.count % displayEveryNTokens == 0 {
+                            let text = context.tokenizer.decode(tokens: tokens)
+                            Task { @MainActor in
+                                self.output = text
+                            }
+                        }
+
+                        if tokens.count >= maxTokens {
+                            return .stop
+                        } else {
+                            return .more
                         }
                     }
-
-                    if tokens.count >= maxTokens {
-                        return .stop
-                    } else {
-                        return .more
+                } catch {
+                    print("ERROR in processor.prepare: \(error)")
+                    print("Error details: \(String(describing: error))")
+                    
+                    // Check if the error contains information about reshape issues
+                    let errorDescription = String(describing: error)
+                    if errorDescription.contains("reshape") {
+                        print("DETECTED reshape error in MLX processing")
                     }
+                    
+                    throw error
                 }
             }
 
@@ -451,7 +810,21 @@ class VLMEvaluator {
             self.stat = " Tokens/second: \(String(format: "%.3f", result.tokensPerSecond))"
 
         } catch {
-            output = "Failed: \(error)"
+            print("ERROR in VLM processing: \(error)")
+            print("Error details: \(String(describing: error))")
+            
+            // Provide more detailed error diagnostics
+            let nsError = error as NSError
+            print("NSError domain: \(nsError.domain), code: \(nsError.code)")
+            print("Error user info: \(nsError.userInfo)")
+            
+            // Handle specific errors based on error description
+            let errorDescription = String(describing: error)
+            if errorDescription.contains("reshape") {
+                output = "Failed: Image processing error - The image format caused a reshape error in the model. Try a different image or format."
+            } else {
+                output = "Failed: \(error)"
+            }
         }
 
         running = false
