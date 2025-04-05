@@ -450,10 +450,12 @@ struct ContentView: View {
         
         print("macOS: Drawing image with scale factor: \(scale), new size: \(newWidth) x \(newHeight)")
         
-        if let nsImage = NSImage(ciImage: ciImage, size: ciImage.extent.size) {
-            nsImage.draw(in: NSRect(x: xOffset, y: yOffset, width: newWidth, height: newHeight),
-                       from: NSRect(origin: .zero, size: nsImage.size),
-                       operation: .copy,
+        // Create a CGImage from the CIImage
+        if let cgImageFromCI = squareContext.createCGImage(ciImage, from: ciImage.extent) {
+            let tempNSImage = NSImage(cgImage: cgImageFromCI, size: ciImage.extent.size)
+            tempNSImage.draw(in: NSRect(x: xOffset, y: yOffset, width: newWidth, height: newHeight),
+                       from: NSRect(origin: .zero, size: tempNSImage.size),
+                       operation: .sourceOver,
                        fraction: 1.0)
         }
         
